@@ -16,39 +16,43 @@ def explain_move(move_data):
     eval_change = move_data["eval_change"]
     fen_before = move_data["fen_before"]
 
-    prompt = f"""
-You are a chess coach explaining a move to a beginner-intermediate player.
+    is_bad_move = quality in ("inaccuracy", "mistake", "blunder")
 
-Position before the move (FEN):
-{fen_before}
+    if is_bad_move:
+        instruction = f"""The player played {move}, which was a {quality}. The best move was {best_move}.
 
-Player's move:
-{move}
+Explain in exactly 2-3 sentences:
+1. What concrete problem or threat the player's move creates (or fails to address).
+2. What {best_move} does instead and why it is stronger.
+3. One practical lesson the player can take away.
 
-Best engine move:
-{best_move}
+Example of the tone and style to use:
+---
+Player move: Nf6?? | Best move: d5 | Quality: blunder
+"By moving the knight to f6, you left your e5-pawn completely undefended, allowing White to win it for free next move. Instead, d5 would have struck at the center and kept your position solid. When your pieces are under pressure, prioritize defending your material before making active moves."
+---"""
+    else:
+        instruction = f"""The player played {move}, which was a good move.
 
-Evaluation before the move:
-{eval_before}
+Confirm in 1-2 sentences why this move was strong — what threat it created, what it defended, or what positional idea it achieved.
 
-Evaluation after the move:
-{eval_after}
+Example of the tone and style to use:
+---
+Player move: d5 | Quality: good
+"d5 was an excellent choice — it immediately challenged White's control of the center and opened lines for your bishops to become active."
+---"""
 
-Evaluation change:
-{eval_change}
+    prompt = f"""You are a chess coach explaining a single chess move to a beginner-intermediate player.
 
-Move quality:
-{quality}
+Position (FEN): {fen_before}
 
-Write 2-3 sentences.
-Explain:
-1. what the player's move tried to do,
-2. why it was good or bad,
-3. why the engine move was better if the move was not best.
+{instruction}
 
-Be simple, specific, and practical.
-Do not mention centipawns or raw numbers unless necessary.
-"""
+Rules:
+- Never mention centipawns, evaluation scores, or any numbers.
+- Be concrete and specific to this position — avoid generic advice.
+- Use plain, simple language a beginner can understand.
+- Do not start with "In this position" or restate the move quality label."""
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",

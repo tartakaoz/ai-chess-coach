@@ -2,6 +2,7 @@ import chess
 import chess.pgn
 import chess.engine
 import io
+from concurrent.futures import ThreadPoolExecutor
 from app.explanation import explain_move, summarize_game
 
 engine = chess.engine.SimpleEngine.popen_uci("stockfish")
@@ -30,10 +31,14 @@ def analyze_game(pgn_text, color):
             best_move = info_before["pv"][0] if "pv" in info_before and info_before["pv"] else None
             best_move_san = board.san(best_move) if best_move else None
 
+        move_from = chess.square_name(move.from_square)
+        move_to = chess.square_name(move.to_square)
         san_move = board.san(move)
         board.push(move)
 
         if is_user_move:
+            fen_after = board.fen()
+
             info_after = engine.analyse(board, chess.engine.Limit(depth=12))
             score_after = info_after["score"].pov(user_is_white)
             eval_after = score_after.score(mate_score=10000)
@@ -51,20 +56,29 @@ def analyze_game(pgn_text, color):
 
             move_data = {
                 "move": san_move,
+                "move_from": move_from,
+                "move_to": move_to,
                 "fen_before": fen_before,
+                "fen_after": fen_after,
                 "best_move": best_move_san,
+                "best_move_from": chess.square_name(best_move.from_square) if best_move else None,
+                "best_move_to": chess.square_name(best_move.to_square) if best_move else None,
                 "eval_before": eval_before,
                 "eval_after": eval_after,
                 "eval_change": eval_change,
                 "quality": quality
             }
 
-            move_data["explanation"] = explain_move(move_data)
             moves_data.append(move_data)
 
-        bad_moves = [move for move in moves_data if move["quality"] != "good"]
-        bad_moves.sort(key=lambda x: x["eval_change"])
-        worst_moves = bad_moves[:3]
+    bad_moves = [move for move in moves_data if move["quality"] != "good"]
+    bad_moves.sort(key=lambda x: x["eval_change"])
+    worst_moves = bad_moves[:3]
+
+    with ThreadPoolExecutor() as executor:
+        explanations = list(executor.map(explain_move, worst_moves))
+    for move_data, explanation in zip(worst_moves, explanations):
+        move_data["explanation"] = explanation
 
     if worst_moves:
         game_summary = summarize_game(worst_moves)
