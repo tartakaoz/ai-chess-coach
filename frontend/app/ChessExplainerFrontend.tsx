@@ -69,14 +69,18 @@ export default function ChessExplainerFrontend() {
   const positions = useMemo(() => buildPositionsFromPgn(pgn), [pgn]);
 
 const displayFen = selectedMove ? selectedMove.fen_before : positions[boardIndex];
-const selectedMovePositionIndex =
-  selectedMove ? positions.findIndex((fen) => fen === selectedMove.fen_before) : -1;
   // Eval bar: cap at ±1000 centipawns (±10 pawns)
-  const clampedEval = selectedMove
-    ? Math.max(-1000, Math.min(1000, selectedMove.eval_before))
-    : 0;
-  const whitePct = ((clampedEval + 1000) / 2000) * 100;
-  const blackPct = 100 - whitePct;
+  const evalCp = selectedMove
+  ? selectedMove.eval_before
+: result?.position_evals?.find((p: any) => p.move_index === boardIndex)?.eval ?? 0;
+
+      const clampedEval = Math.max(-1000, Math.min(1000, evalCp));
+      const whitePct = ((clampedEval + 1000) / 2000) * 100;
+      const blackPct = 100 - whitePct;
+
+      <div style={{ fontSize: "12px", marginBottom: "8px" }}>
+  evalCp: {evalCp}
+</div>
 
   // Square highlight for user's move_to square
   const squareStyles = selectedMove && QUALITY_HIGHLIGHT_COLORS[selectedMove.quality]
@@ -111,7 +115,6 @@ const selectedMovePositionIndex =
         {/* Column 2: Board + navigator */}
         <div style={{ width: "480px" }}>
           <div style={{ marginBottom: "8px", fontSize: "12px", wordBreak: "break-all" }}>
-          <strong>displayFen:</strong> {displayFen}
         </div>
 <div style={{ width: "480px" }}>
   <Chessboard
@@ -142,7 +145,7 @@ const selectedMovePositionIndex =
             </button>
 <span>
   {selectedMove
-    ? `Showing analysis position: ${selectedMovePositionIndex + 1} / ${positions.length}`
+    ? `Showing analysis position: ${selectedMove.move_index} / ${positions.length}`
     : `Position ${boardIndex + 1} / ${positions.length}`}
 </span>
           </div>
@@ -201,12 +204,8 @@ const selectedMovePositionIndex =
                 <div
                   key={index}
                   onClick={() => {
-                    const moveIndex = positions.findIndex((fen) => fen === move.fen_before);
-                  setSelectedMove(move);
-                if  (moveIndex !== -1) {
-                setBoardIndex(moveIndex);
-                
-              }
+                    setSelectedMove(move);
+                    setBoardIndex(move.move_index - 1); 
                   }}
                   style={{
                     marginBottom: "16px",

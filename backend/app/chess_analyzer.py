@@ -13,9 +13,13 @@ def analyze_game(pgn_text, color):
     board = game.board()
 
     moves_data = []
+    position_index = 0
+    position_evals = [{"move_index": 0, "eval": 0}]
     user_is_white = (color == "white")
 
     for move in game.mainline_moves():
+        position_index += 1
+
         is_user_move = (
             (board.turn and user_is_white) or
             (not board.turn and not user_is_white)
@@ -34,14 +38,21 @@ def analyze_game(pgn_text, color):
         move_from = chess.square_name(move.from_square)
         move_to = chess.square_name(move.to_square)
         san_move = board.san(move)
+
         board.push(move)
+
+        info_position = engine.analyse(board, chess.engine.Limit(depth=12))
+        score_position = info_position["score"].pov(user_is_white)
+        eval_position = score_position.score(mate_score=10000)
+
+        position_evals.append({
+            "move_index": position_index,
+            "eval": eval_position
+        })
 
         if is_user_move:
             fen_after = board.fen()
-
-            info_after = engine.analyse(board, chess.engine.Limit(depth=12))
-            score_after = info_after["score"].pov(user_is_white)
-            eval_after = score_after.score(mate_score=10000)
+            eval_after = eval_position
 
             eval_change = eval_after - eval_before
 
@@ -55,6 +66,7 @@ def analyze_game(pgn_text, color):
                 quality = "blunder"
 
             move_data = {
+                "move_index": position_index,
                 "move": san_move,
                 "move_from": move_from,
                 "move_to": move_to,
@@ -77,6 +89,7 @@ def analyze_game(pgn_text, color):
 
     with ThreadPoolExecutor() as executor:
         explanations = list(executor.map(explain_move, worst_moves))
+
     for move_data, explanation in zip(worst_moves, explanations):
         move_data["explanation"] = explanation
 
@@ -90,5 +103,6 @@ def analyze_game(pgn_text, color):
 
     return {
         "critical_moves": worst_moves,
+        "position_evals": position_evals,
         "game_summary": game_summary
     }
