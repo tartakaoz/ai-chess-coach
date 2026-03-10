@@ -1,6 +1,7 @@
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
+import json
 
 load_dotenv()
 
@@ -74,12 +75,15 @@ Write:
 2. Exactly 3 lessons the player should learn from this game.
 
 Keep it simple, practical, and educational.
-Return the response in plain text.
+Return a JSON object with exactly two keys:
+- "summary": a string (2-3 sentences overall summary)
+- "lessons": an array of exactly 3 strings (one lesson per item)
 """
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
     )
 
-    return response.choices[0].message.content
+    return json.loads(response.choices[0].message.content)
