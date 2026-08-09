@@ -1,8 +1,13 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { Chess } from "chess.js";
-import { Chessboard } from "react-chessboard";
+
+const Chessboard = dynamic(
+  () => import("react-chessboard").then((m) => ({ default: m.Chessboard })),
+  { ssr: false }
+);
 
 const SAMPLE_PGN = `1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 7. Bb3 d6 8. c3 O-O 9. h3 Nb8 10. d4 Nbd7 11. c4 c6 12. Nc3 Qc7 13. Be3 Bb7 14. Rc1 Rfe8 15. cxb5 axb5 16. Nxb5 Qb8 17. Nc3 Bf8 18. dxe5 dxe5 19. Ng5 Re7 20. f4 h6 21. Nxf7 Rxf7 22. fxe5 Nxe5 23. Rf1 Ba6 24. Rf5 Nc4 25. Bd4 Qg3 26. Rf3 Qg5 27. Qe1 Nd2 28. Rg3 Nf3+ 29. gxf3 Qh5 30. Bxf6 Bc5+ 31. Kh2 Bd6 32. e5 Bc7 33. Rxg7+ Kf8 34. Rxf7+ Qxf7 35. Bxf7 Kxf7 36. Qe4 Rg8 37. Qh7+ Ke6 38. Qxg8+ Kf5 39. Qg4#`;
 
@@ -62,7 +67,8 @@ export default function ChessExplainerFrontend() {
   const [result, setResult] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [selectedMove, setSelectedMove] = useState<any>(null);
-  const [expandedCards, setExpandedCards] = useState<Set<number>>(new Set());
+  const [expandedCard, setExpandedCard] = useState<number | null>(null);
+  const cardRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const [modal, setModal] = useState<"summary" | "lessons" | null>(null);
 
 
@@ -74,12 +80,19 @@ export default function ChessExplainerFrontend() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pgn, color }),
       });
+      if (!response.ok) {
+        const text = await response.text();
+        console.error("Analysis failed: HTTP", response.status, text);
+        setLoading(false);
+        return;
+      }
       const data = await response.json();
+      console.log("Analysis response:", JSON.stringify(data, null, 2));
       setResult(data);
       setSelectedMove(null);
       setBoardIndex(0);
     } catch (error) {
-      console.error("Analysis failed:", error);
+      console.error("Analysis failed:", error instanceof Error ? error.message : error, error);
     }
     setLoading(false);
     mainRef.current?.focus();
@@ -118,15 +131,51 @@ export default function ChessExplainerFrontend() {
   const boardIndexRef = useRef(boardIndex);
   useEffect(() => { boardIndexRef.current = boardIndex; }, [boardIndex]);
 
-  const soundsRef = useRef<Record<string, HTMLAudioElement>>({});
   useEffect(() => {
-    soundsRef.current = {
-      move:      new Audio("https://lichess1.org/assets/sound/standard/Move.ogg"),
-      capture:   new Audio("https://lichess1.org/assets/sound/standard/Capture.ogg"),
-      castle:    new Audio("https://lichess1.org/assets/sound/standard/Castle.ogg"),
-      promote:   new Audio("https://lichess1.org/assets/sound/standard/Promote.ogg"),
-      check:     new Audio("https://lichess1.org/assets/sound/standard/Check.ogg"),
-      checkmate: new Audio("https://lichess1.org/assets/sound/standard/GenericNotify.ogg"),
+    if (!result?.critical_moves) return;
+    const match = result.critical_moves.find((m: any) => m.move_index === boardIndex);
+    if (match) {
+      setExpandedCard(match.move_index);
+      const el = cardRefs.current[match.move_index];
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [boardIndex, result]);
+
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const buffersRef = useRef<Record<string, AudioBuffer>>({});
+
+  useEffect(() => {
+    const soundFiles: Record<string, string> = {
+      move:      "/sounds/Move.mp3",
+      capture:   "/sounds/Capture.mp3",
+      castle:    "/sounds/Move.mp3",
+      promote:   "/sounds/Promote.mp3",
+      check:     "/sounds/GenericNotify.mp3",
+      checkmate: "/sounds/Victory.mp3",
+    };
+
+    const initAudio = () => {
+      if (audioCtxRef.current) return;
+      const ctx = new AudioContext();
+      audioCtxRef.current = ctx;
+      console.log('[Sound] AudioContext created, state:', ctx.state);
+      Object.entries(soundFiles).forEach(([key, path]) => {
+        fetch(path)
+          .then(r => r.arrayBuffer())
+          .then(ab => ctx.decodeAudioData(ab))
+          .then(buf => {
+            buffersRef.current[key] = buf;
+            console.log('[Sound] Buffer loaded:', key);
+          })
+          .catch(err => console.error('[Sound] Buffer load failed:', key, err));
+      });
+    };
+
+    window.addEventListener("pointerdown", initAudio, { once: true });
+    window.addEventListener("keydown", initAudio, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", initAudio);
+      window.removeEventListener("keydown", initAudio);
     };
   }, []);
 
@@ -144,9 +193,38 @@ export default function ChessExplainerFrontend() {
     else if (isCastle)     key = "castle";
     else if (isPromotion)  key = "promote";
     else if (isCapture)    key = "capture";
-    const snd = soundsRef.current[key];
-    if (snd) { (snd.cloneNode() as HTMLAudioElement).play().catch(() => {}); }
+    const ctx = audioCtxRef.current;
+    const buf = buffersRef.current[key];
+    console.log('[Sound] playMoveSound — key:', key, '| ctx:', ctx?.state ?? 'null', '| buf:', buf ? 'loaded' : 'missing');
+    if (ctx && buf) {
+      ctx.resume().then(() => {
+        const gain = ctx.createGain();
+        gain.gain.value = 0.4;
+        gain.connect(ctx.destination);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(gain);
+        src.start();
+      });
+    }
   }, [moveHistory]);
+
+  const playBackSound = useCallback(() => {
+    const ctx = audioCtxRef.current;
+    const buf = buffersRef.current["move"];
+    console.log('[Sound] playBackSound — ctx:', ctx?.state ?? 'null', '| buf:', buf ? 'loaded' : 'missing');
+    if (ctx && buf) {
+      ctx.resume().then(() => {
+        const gain = ctx.createGain();
+        gain.gain.value = 0.2;
+        gain.connect(ctx.destination);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(gain);
+        src.start();
+      });
+    }
+  }, []);
 
   const goNext = useCallback(async () => {
     if (result === null && !loading) {
@@ -192,7 +270,7 @@ export default function ChessExplainerFrontend() {
         const prev = Math.max(boardIndexRef.current - 1, 0);
         setBoardIndex(prev);
         setSelectedMove(null);
-        if (prev > 0) { const s = soundsRef.current["move"]; if (s) (s.cloneNode() as HTMLAudioElement).play().catch(() => {}); }
+        if (prev > 0) { playBackSound(); }
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
         goNext();
@@ -245,9 +323,26 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
     squareColorMap[lastMove.to] = moveQualityColor;
   }
 
-  // Green arrow showing the best engine move
-  const arrows = selectedMove?.best_move_from && selectedMove?.best_move_to
-    ? [{ startSquare: selectedMove.best_move_from, endSquare: selectedMove.best_move_to, color: "green" }]
+  // Single best-move arrow: green if White to move, red if Black to move.
+  // Hidden at move 0, when balanced (|eval| ≤ 50), or when the best move matches
+  // the move actually played (it was already a good move).
+  // Always shown at mistake/blunder positions regardless of eval threshold.
+  const posEval = result?.position_evals?.find((p: any) => p.move_index === boardIndex);
+  const arrowColor = boardIndex % 2 === 0 ? "green" : "red";
+  const isMistakeIndex = (result?.critical_moves ?? []).some((m: any) => m.move_index === boardIndex);
+  const playedMove = boardIndex > 0 ? moveHistory[boardIndex] : null;
+  const bestMatchesPlayed =
+    playedMove &&
+    posEval?.best_move &&
+    posEval.best_move.slice(0, 2) === playedMove.from &&
+    posEval.best_move.slice(2, 4) === playedMove.to;
+  const showArrow =
+    boardIndex > 0 &&
+    posEval?.best_move &&
+    !bestMatchesPlayed &&
+    (isMistakeIndex || Math.abs(posEval.eval ?? 0) > 50);
+  const arrows: { startSquare: string; endSquare: string; color: string }[] = showArrow
+    ? [{ startSquare: posEval.best_move.slice(0, 2), endSquare: posEval.best_move.slice(2, 4), color: arrowColor }]
     : [];
 
   const btnStyle: React.CSSProperties = {
@@ -357,7 +452,7 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
               const prev = Math.max(boardIndex - 1, 0);
               setBoardIndex(prev);
               setSelectedMove(null);
-              if (prev > 0) { const s = soundsRef.current["move"]; if (s) (s.cloneNode() as HTMLAudioElement).play().catch(() => {}); }
+              if (prev > 0) { playBackSound(); }
             }}>
               Previous
             </button>
@@ -421,27 +516,24 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
                 Critical Moves
               </div>
               <div style={{ maxHeight: "180px", overflowY: "auto", flexShrink: 0 }}>
-              {result.critical_moves.map((move: any, index: number) => {
-                const isExpanded = expandedCards.has(move.move_index);
+              {(result.critical_moves ?? []).map((move: any, index: number) => {
+                const isExpanded = expandedCard === move.move_index;
                 return (
                   <div
                     key={index}
+                    ref={(el) => { cardRefs.current[move.move_index] = el; }}
                     onClick={() => {
                       setSelectedMove(move);
                       setBoardIndex(move.move_index);
                       playMoveSound(move.move_index);
-                      setExpandedCards((prev) => {
-                        const next = new Set(prev);
-                        next.has(move.move_index) ? next.delete(move.move_index) : next.add(move.move_index);
-                        return next;
-                      });
+                      setExpandedCard((prev) => prev === move.move_index ? null : move.move_index);
                     }}
                     style={{
                       marginBottom: "10px", padding: "10px 12px",
                       background: QUALITY_CARD_COLORS[move.quality] ?? "rgba(255,255,255,0.05)",
                       borderRadius: "8px",
                       border: selectedMove === move ? "1px solid #d4af37" : "1px solid rgba(255,255,255,0.1)",
-                      color: "#e8e0d0", cursor: "pointer", fontSize: "13px", lineHeight: "1.6",
+                      color: "#e8e0d0", cursor: "pointer", fontSize: "15px", lineHeight: "1.6",
                     }}
                   >
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
@@ -449,19 +541,30 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
                         <span style={{ color: "#d4af37", fontWeight: 700, marginRight: "6px" }}>{formatMoveLabel(move.move_index)}</span>
                         <span style={{ fontWeight: 600 }}>{move.move}</span>
                         <span style={{ margin: "0 6px", opacity: 0.4 }}>·</span>
-                        <span style={{ fontSize: "12px", opacity: 0.75 }}>Best: {move.best_move}</span>
+                        <span style={{ fontSize: "15px", opacity: 0.75 }}>Best: {move.best_move}</span>
                         <span style={{ margin: "0 6px", opacity: 0.4 }}>·</span>
-                        <span style={{ fontSize: "12px" }}>
+                        <span style={{ fontSize: "15px" }}>
                           {QUALITY_ICONS[move.quality]}{" "}
                           <span style={{ textTransform: "capitalize" }}>{move.quality}</span>
                         </span>
                       </div>
-                      <span style={{ fontSize: "11px", opacity: 0.5, flexShrink: 0 }}>{isExpanded ? "▲" : "▼"}</span>
+                      <span style={{ fontSize: "13px", opacity: 0.5, flexShrink: 0 }}>{isExpanded ? "▲" : "▼"}</span>
                     </div>
                     {isExpanded && (
-                      <p style={{ margin: "8px 0 0", color: "rgba(232,224,208,0.8)", borderTop: "1px solid rgba(255,255,255,0.1)", paddingTop: "8px" }}>
-                        {move.explanation}
-                      </p>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: "10px", marginTop: "10px", borderTop: "1px solid rgba(255,255,255,0.1)", paddingTop: "10px" }}>
+                        {/* Alien coach avatar */}
+                        <img
+                          src="/alien-coach.svg"
+                          alt="Alien chess coach"
+                          style={{ width: "48px", height: "48px", borderRadius: "50%", flexShrink: 0, background: "#0d1b2a", border: "1px solid rgba(212,175,55,0.3)" }}
+                        />
+                        {/* Speech bubble */}
+                        <div style={{ position: "relative", background: "rgba(240,236,220,0.95)", color: "#1a1a2e", borderRadius: "10px", padding: "10px 13px", fontSize: "14px", lineHeight: "1.65", flex: 1, border: "1px solid rgba(212,175,55,0.5)" }}>
+                          {/* Left-pointing triangle */}
+                          <div style={{ position: "absolute", left: "-8px", top: "14px", width: 0, height: 0, borderTop: "7px solid transparent", borderBottom: "7px solid transparent", borderRight: "8px solid rgba(240,236,220,0.95)" }} />
+                          {move.explanation}
+                        </div>
+                      </div>
                     )}
                   </div>
                 );
@@ -575,6 +678,11 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
             }}>
               {loading ? "Analysing…" : "Analyse Game"}
             </button>
+            {loading && (
+              <div style={{ marginTop: "8px", fontSize: "12px", color: "rgba(200,191,176,0.6)", textAlign: "center" }}>
+                Analysing positions… this may take a moment
+              </div>
+            )}
           </div>
 
         </div>
@@ -599,9 +707,9 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
               border: "1px solid rgba(212,175,55,0.4)",
               borderRadius: "12px",
               padding: "28px 32px",
-              maxWidth: "560px",
+              maxWidth: "768px",
               width: "100%",
-              maxHeight: "80vh",
+              maxHeight: "82vh",
               overflowY: "auto",
               boxShadow: "0 24px 64px rgba(0,0,0,0.6)",
             }}
@@ -625,12 +733,12 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
             {/* Modal content */}
             {modal === "summary" && (
               <ul style={{ margin: 0, padding: "0 0 0 20px", listStyle: "disc" }}>
-                {result.game_summary
+                {(result.game_summary ?? "")
                   .split(/(?<=\.)\s+/)
                   .map((s: string) => s.trim())
                   .filter((s: string) => s.length > 0)
                   .map((sentence: string, i: number) => (
-                    <li key={i} style={{ color: "rgba(232,224,208,0.88)", fontSize: "14px", lineHeight: "1.75", marginBottom: "6px" }}>
+                    <li key={i} style={{ color: "rgba(232,224,208,0.88)", fontSize: "16px", lineHeight: "1.75", marginBottom: "6px" }}>
                       {sentence.endsWith(".") ? sentence : sentence + "."}
                     </li>
                   ))}
@@ -639,8 +747,8 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
 
             {modal === "lessons" && (
               <ul style={{ margin: 0, padding: "0 0 0 20px", listStyle: "disc" }}>
-                {result.lessons.map((lesson: string, i: number) => (
-                  <li key={i} style={{ color: "rgba(232,224,208,0.88)", fontSize: "14px", lineHeight: "1.75", marginBottom: "10px" }}>
+                {(result.lessons ?? []).map((lesson: string, i: number) => (
+                  <li key={i} style={{ color: "rgba(232,224,208,0.88)", fontSize: "16px", lineHeight: "1.75", marginBottom: "10px" }}>
                     {lesson}
                   </li>
                 ))}

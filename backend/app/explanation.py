@@ -1,66 +1,94 @@
-from openai import OpenAI
+from anthropic import Anthropic
 from dotenv import load_dotenv
 import os
 import json
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 
-def explain_move(move_data):
-    move = move_data["move"]
-    best_move = move_data["best_move"]
-    quality = move_data["quality"]
-    eval_before = move_data["eval_before"]
-    eval_after = move_data["eval_after"]
-    eval_change = move_data["eval_change"]
-    fen_before = move_data["fen_before"]
+def _facts_to_plain_english(facts: dict) -> str:
+    """
+    Convert the pre-computed facts dict (built by chess_analyzer._compute_move_facts)
+    into a plain-English bullet list. Every statement is a verified Python-computed fact.
+    """
+    lines = []
 
-    is_bad_move = quality in ("inaccuracy", "mistake", "blunder")
+    # What the player moved and where
+    move_desc = (
+        f"- You moved {facts['moved_piece']} from {facts['from_square']}"
+        f" to {facts['to_square']}"
+    )
+    if facts.get("captured"):
+        move_desc += f", {facts['captured']}"
+    move_desc += "."
+    lines.append(move_desc)
 
-    if is_bad_move:
-        instruction = f"""The player played {move}, which was a {quality}. The best move was {best_move}.
+    # Material impact of the played move
+    lines.append(
+        f"- Before this move, material was {facts['balance_before']}. "
+        f"After this move, material is {facts['balance_after_played']}."
+    )
 
-Explain in exactly 2-3 sentences:
-1. What concrete problem or threat the player's move creates (or fails to address).
-2. What {best_move} does instead and why it is stronger.
-3. One practical lesson the player can take away.
+    # Hanging / undefended pieces after the played move
+    for h in facts.get("hanging_after_played", []):
+        lines.append(f"- After this move, {h}.")
 
-Example of the tone and style to use:
----
-Player move: Nf6?? | Best move: d5 | Quality: blunder
-"By moving the knight to f6, you left your e5-pawn completely undefended, allowing White to win it for free next move. Instead, d5 would have struck at the center and kept your position solid. When your pieces are under pressure, prioritize defending your material before making active moves."
----"""
-    else:
-        instruction = f"""The player played {move}, which was a good move.
+    # Best move
+    bm = facts.get("best_move")
+    if bm:
+        bm_desc = (
+            f"- The better move was to move {bm['piece']}"
+            f" from {bm['from_square']} to {bm['to_square']}"
+        )
+        if bm.get("captured"):
+            bm_desc += f", {bm['captured']}"
+        bm_desc += f". After that, material would have been {bm['balance_after']}."
+        lines.append(bm_desc)
 
-Confirm in 1-2 sentences why this move was strong — what threat it created, what it defended, or what positional idea it achieved.
+    return "\n".join(lines)
 
-Example of the tone and style to use:
----
-Player move: d5 | Quality: good
-"d5 was an excellent choice — it immediately challenged White's control of the center and opened lines for your bishops to become active."
----"""
 
-    prompt = f"""You are a chess coach explaining a single chess move to a beginner-intermediate player.
+def explain_move(move_data: dict) -> str:
+    facts     = move_data.get("move_facts", {})
+    move      = move_data["move"]
+    best_move = move_data["best_move"] or "unknown"
+    quality   = move_data["quality"]
+    cp_loss   = abs(move_data["eval_change"])
 
-Position (FEN): {fen_before}
+    facts_text = _facts_to_plain_english(facts)
 
-{instruction}
+    minor_prefix = (
+        "This wasn't a big mistake, but " if cp_loss < 60 else ""
+    )
 
-Rules:
-- Never mention centipawns, evaluation scores, or any numbers.
-- Be concrete and specific to this position — avoid generic advice.
-- Use plain, simple language a beginner can understand.
-- Do not start with "In this position" or restate the move quality label."""
+    prompt = (
+        f"You are a friendly chess coach writing a 2-sentence explanation for a beginner.\n\n"
+        f"The player played {move}, which was a {quality} (centipawn loss: {cp_loss}). "
+        f"The best move was {best_move}.\n\n"
+        f"Here are the ONLY facts you may use — do not add anything else:\n"
+        f"{facts_text}\n\n"
+        f"Explain WHY the best move is better, not just that it is better. "
+        f"What does it do or prevent? What does the mistake allow? "
+        f"Use only the facts provided. 2 sentences max. Beginner friendly.\n\n"
+        f"Sentence 1: What does the opponent's best reply take advantage of after {move}? "
+        f"If no material is won, what problem does it create?\n"
+        f"Sentence 2: What does {best_move} achieve concretely?\n\n"
+        f"If the centipawn loss is under 60, start with: \"{minor_prefix}\"\n\n"
+        f"Write directly to the player. Do not mention any piece, square, capture, or threat "
+        f"that is not listed in the facts above."
+    )
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+    print(f"--- PROMPT SENT TO CLAUDE ---\n{prompt}\n----------------------------")
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=300,
         messages=[{"role": "user", "content": prompt}]
     )
 
-    return response.choices[0].message.content
+    return response.content[0].text
 
 
 def summarize_game(critical_moves):
@@ -78,12 +106,14 @@ Keep it simple, practical, and educational.
 Return a JSON object with exactly two keys:
 - "summary": a string (2-3 sentences overall summary)
 - "lessons": an array of exactly 3 strings (one lesson per item)
+
+Return only the JSON object, no other text.
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
     )
 
-    return json.loads(response.choices[0].message.content)
+    return json.loads(response.content[0].text)
