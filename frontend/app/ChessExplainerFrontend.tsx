@@ -154,11 +154,7 @@ export default function ChessExplainerFrontend() {
       checkmate: "/sounds/Victory.mp3",
     };
 
-    const initAudio = () => {
-      if (audioCtxRef.current) return;
-      const ctx = new AudioContext();
-      audioCtxRef.current = ctx;
-      console.log('[Sound] AudioContext created, state:', ctx.state);
+    const loadBuffers = (ctx: AudioContext) => {
       Object.entries(soundFiles).forEach(([key, path]) => {
         fetch(path)
           .then(r => r.arrayBuffer())
@@ -171,11 +167,45 @@ export default function ChessExplainerFrontend() {
       });
     };
 
+    const initAudio = () => {
+      if (audioCtxRef.current) return;
+      const ctx = new AudioContext();
+      audioCtxRef.current = ctx;
+      console.log('[Sound] AudioContext created, state:', ctx.state);
+      loadBuffers(ctx);
+    };
+
+    // Safari (and some other browsers) suspend, or sometimes fully close, the
+    // AudioContext when the tab is backgrounded to save power. Without this,
+    // switching away and back leaves sound permanently dead until a hard reload.
+    // When the tab becomes visible/focused again: resume a merely-suspended
+    // context, or recreate it (and re-decode all buffers) if it was closed outright.
+    const handleVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      if (ctx.state === "closed") {
+        console.warn('[Sound] AudioContext was closed while tab was backgrounded — recreating.');
+        const fresh = new AudioContext();
+        audioCtxRef.current = fresh;
+        buffersRef.current = {};
+        loadBuffers(fresh);
+      } else if (ctx.state === "suspended") {
+        ctx.resume()
+          .then(() => console.log('[Sound] AudioContext resumed after tab became visible.'))
+          .catch(err => console.error('[Sound] Failed to resume AudioContext on visibility change:', err));
+      }
+    };
+
     window.addEventListener("pointerdown", initAudio, { once: true });
     window.addEventListener("keydown", initAudio, { once: true });
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleVisibility);
     return () => {
       window.removeEventListener("pointerdown", initAudio);
       window.removeEventListener("keydown", initAudio);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleVisibility);
     };
   }, []);
 
@@ -205,7 +235,7 @@ export default function ChessExplainerFrontend() {
         src.buffer = buf;
         src.connect(gain);
         src.start();
-      });
+      }).catch(err => console.error('[Sound] playMoveSound resume/play failed:', err));
     }
   }, [moveHistory]);
 
@@ -222,7 +252,7 @@ export default function ChessExplainerFrontend() {
         src.buffer = buf;
         src.connect(gain);
         src.start();
-      });
+      }).catch(err => console.error('[Sound] playBackSound resume/play failed:', err));
     }
   }, []);
 
