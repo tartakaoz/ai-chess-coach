@@ -83,7 +83,7 @@ def explain_move(move_data: dict) -> str:
     print(f"--- PROMPT SENT TO CLAUDE ---\n{prompt}\n----------------------------")
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -111,9 +111,26 @@ Return only the JSON object, no other text.
 """
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}]
     )
 
-    return json.loads(response.content[0].text)
+    raw = response.content[0].text.strip()
+
+    # Claude sometimes wraps JSON in markdown code fences despite instructions
+    # not to — strip them before parsing.
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"--- FAILED TO PARSE SUMMARY JSON ---\n{raw}\n-------------------------------------")
+        return {
+            "summary": "Summary unavailable due to a formatting error — check server logs.",
+            "lessons": [],
+        }
