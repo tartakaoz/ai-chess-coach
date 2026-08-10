@@ -190,6 +190,10 @@ export default function ChessExplainerFrontend() {
       setExpandedCard(match.move_index);
       const el = cardRefs.current[match.move_index];
       if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } else {
+      // Close whatever was auto-expanded once you've navigated past it —
+      // previously this only ever opened a card, never closed one.
+      setExpandedCard(null);
     }
   }, [boardIndex, result]);
 
@@ -299,6 +303,34 @@ export default function ChessExplainerFrontend() {
     playSound("move", 0.2);
   }, [playSound]);
 
+  // Sound for stepping through an explored line — replays the line up to the
+  // target step with chess.js to figure out what kind of move just happened
+  // (capture, check, castle, etc.), since exploring.moves only has plain SAN
+  // strings, not the verbose move info playMoveSound normally reads.
+  const playExploreStep = useCallback((targetStep: number, currentStep: number) => {
+    if (!exploring || targetStep === currentStep) return;
+    if (targetStep < currentStep) {
+      if (targetStep > 0) playBackSound();
+      return;
+    }
+    try {
+      const replay = new Chess(exploring.fens[0]);
+      for (let i = 0; i < targetStep - 1; i++) replay.move(exploring.moves[i]);
+      const res = replay.move(exploring.moves[targetStep - 1]);
+      if (!res) return;
+      const isCastle = res.san === "O-O-O" || res.san === "O-O";
+      const isPromotion = res.flags.includes("p");
+      const isCapture = res.flags.includes("c") || res.flags.includes("e");
+      let key = "move";
+      if (replay.isCheckmate())      key = "checkmate";
+      else if (replay.isCheck())     key = "check";
+      else if (isCastle)             key = "castle";
+      else if (isPromotion)          key = "promote";
+      else if (isCapture)            key = "capture";
+      playSound(key, 0.4);
+    } catch { /* malformed line — just skip the sound */ }
+  }, [exploring, playBackSound, playSound]);
+
   const goNext = useCallback(async () => {
     if (result === null && !loading) {
       await analyzeGame();
@@ -341,7 +373,9 @@ export default function ChessExplainerFrontend() {
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         if (exploring) {
-          setExploring((prev) => prev && ({ ...prev, step: Math.max(0, prev.step - 1) }));
+          const newStep = Math.max(0, exploring.step - 1);
+          playExploreStep(newStep, exploring.step);
+          setExploring((prev) => prev && ({ ...prev, step: newStep }));
           return;
         }
         const prev = Math.max(boardIndexRef.current - 1, 0);
@@ -351,7 +385,9 @@ export default function ChessExplainerFrontend() {
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
         if (exploring) {
-          setExploring((prev) => prev && ({ ...prev, step: Math.min(prev.fens.length - 1, prev.step + 1) }));
+          const newStep = Math.min(exploring.fens.length - 1, exploring.step + 1);
+          playExploreStep(newStep, exploring.step);
+          setExploring((prev) => prev && ({ ...prev, step: newStep }));
           return;
         }
         goNext();
@@ -359,7 +395,7 @@ export default function ChessExplainerFrontend() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [goNext, exploring]);
+  }, [goNext, exploring, playExploreStep, playBackSound]);
 
 const displayFen = exploring
   ? exploring.fens[exploring.step]
@@ -551,9 +587,17 @@ const displayFen = exploring
             <span style={{ fontSize: "45px", lineHeight: 1, letterSpacing: "-3px" }}>
               {(topIsWhite ? displayCapturedByWhite : displayCapturedByBlack).map((p, i) => {
                 const side = topIsWhite ? "black" : "white";
+                const isWhitePiece = side === "white";
                 return (
-                  <span key={i} style={{ color: side === "white" ? "#f0d9b5" : "#4a7c6f" }}>
-                    {PIECE_GLYPH[p]?.[side]}
+                  <span
+                    key={i}
+                    style={
+                      isWhitePiece
+                        ? { color: "#ffffff" }
+                        : { color: "#15141f", WebkitTextStroke: "0.6px #e8e0d0", textShadow: "0 0 1px #e8e0d0" }
+                    }
+                  >
+                    {PIECE_GLYPH[p]?.black}
                   </span>
                 );
               })}
@@ -630,9 +674,17 @@ const displayFen = exploring
             <span style={{ fontSize: "45px", lineHeight: 1, letterSpacing: "-3px" }}>
               {(topIsWhite ? displayCapturedByBlack : displayCapturedByWhite).map((p, i) => {
                 const side = topIsWhite ? "white" : "black";
+                const isWhitePiece = side === "white";
                 return (
-                  <span key={i} style={{ color: side === "white" ? "#f0d9b5" : "#4a7c6f" }}>
-                    {PIECE_GLYPH[p]?.[side]}
+                  <span
+                    key={i}
+                    style={
+                      isWhitePiece
+                        ? { color: "#ffffff" }
+                        : { color: "#15141f", WebkitTextStroke: "0.6px #e8e0d0", textShadow: "0 0 1px #e8e0d0" }
+                    }
+                  >
+                    {PIECE_GLYPH[p]?.black}
                   </span>
                 );
               })}
@@ -649,14 +701,22 @@ const displayFen = exploring
                 <button
                   style={btnStyle}
                   disabled={exploring.step === 0}
-                  onClick={() => setExploring((prev) => prev && ({ ...prev, step: Math.max(0, prev.step - 1) }))}
+                  onClick={() => {
+                    const newStep = Math.max(0, exploring.step - 1);
+                    playExploreStep(newStep, exploring.step);
+                    setExploring((prev) => prev && ({ ...prev, step: newStep }));
+                  }}
                 >
                   Previous
                 </button>
                 <button
                   style={btnStyle}
                   disabled={exploring.step >= exploring.fens.length - 1}
-                  onClick={() => setExploring((prev) => prev && ({ ...prev, step: Math.min(prev.fens.length - 1, prev.step + 1) }))}
+                  onClick={() => {
+                    const newStep = Math.min(exploring.fens.length - 1, exploring.step + 1);
+                    playExploreStep(newStep, exploring.step);
+                    setExploring((prev) => prev && ({ ...prev, step: newStep }));
+                  }}
                 >
                   Next
                 </button>
