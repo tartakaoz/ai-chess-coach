@@ -2,8 +2,7 @@ import chess
 import chess.pgn
 import chess.engine
 import io
-from concurrent.futures import ThreadPoolExecutor
-from app.explanation import explain_move, summarize_game
+from app.explanation import move_caption, summarize_game
 
 engine = chess.engine.SimpleEngine.popen_uci("stockfish")
 
@@ -84,7 +83,12 @@ def _hanging_pieces(board: chess.Board, player_color: chess.Color) -> list[str]:
     return results[:4]
 
 
-def _compute_move_facts(fen_before: str, san_move: str, san_best_move: str | None) -> dict:
+def _compute_move_facts(
+    fen_before: str,
+    san_move: str,
+    san_best_move: str | None,
+    best_reply_san: str | None = None,
+) -> dict:
     """
     Parse the position and both moves with python-chess and return a dict of
     plain-English, serialisable facts ready for the explanation module.
@@ -127,12 +131,34 @@ def _compute_move_facts(fen_before: str, san_move: str, san_best_move: str | Non
         board_b.push(bm)
         mat_after_best = (_material_total(board_b, player_color)
                           - _material_total(board_b, opp_color))
+
+        # The single-ply material count above only reflects the instant after the
+        # best move is played — it misses cases where the opponent's natural next
+        # move immediately recaptures the piece that just moved (e.g. a sacrifice
+        # like Bxf7+ that wins a pawn but hands the bishop right back). Without
+        # this, the facts fed to Claude would claim "nothing hanging" for a move
+        # that in fact gets punished on the very next ply.
+        recaptured_piece = None
+        mat_after_best_reply = None
+        if best_reply_san:
+            try:
+                reply_move = board_b.parse_san(best_reply_san)
+                if reply_move.to_square == bm.to_square:
+                    recaptured_piece = _piece_label(bm_piece.piece_type, bm.to_square) if bm_piece else "your piece"
+                board_b.push(reply_move)
+                mat_after_best_reply = (_material_total(board_b, player_color)
+                                        - _material_total(board_b, opp_color))
+            except Exception:
+                pass
+
         facts["best_move"] = {
-            "piece":         f"{player_poss} {_piece_label(bm_piece.piece_type, bm.from_square)}" if bm_piece else "a piece",
-            "from_square":   chess.square_name(bm.from_square),
-            "to_square":     chess.square_name(bm.to_square),
-            "captured":      bm_capture,
-            "balance_after": _balance_desc(mat_after_best),
+            "piece":               f"{player_poss} {_piece_label(bm_piece.piece_type, bm.from_square)}" if bm_piece else "a piece",
+            "from_square":         chess.square_name(bm.from_square),
+            "to_square":           chess.square_name(bm.to_square),
+            "captured":            bm_capture,
+            "balance_after":       _balance_desc(mat_after_best),
+            "recaptured":          recaptured_piece,
+            "balance_after_reply": _balance_desc(mat_after_best_reply) if mat_after_best_reply is not None else None,
         }
 
     return facts
@@ -152,6 +178,65 @@ def _get_pv_san(fen_before: str, san_move: str, depth: int = 15, max_moves: int 
         except Exception:
             break
     return pv_moves
+
+
+def explore_line(fen: str, first_move: str, max_plies: int = 18,
+                  stabilize_threshold: int = 15, stabilize_window: int = 4) -> dict:
+    """
+    Play out a hypothetical continuation from a position, one Stockfish-best
+    move at a time for whichever side is to move, starting with a specific
+    first move (typically the engine's recommendation for a flagged mistake).
+    Returns the resulting FENs, SAN moves, and White-perspective evals at
+    each step, so the frontend can let the player step through it on the
+    board with the eval bar tracking along.
+
+    This is on-demand (called only when a user asks to explore a specific
+    line), not run during the main analysis — evaluating every ply of a
+    hypothetical line requires a fresh engine search per ply, which is too
+    slow to do for every flagged mistake up front.
+
+    Stops once the position has clearly settled down — the eval has barely
+    moved for a few plies in a row — or after max_plies, whichever comes
+    first, so a forced sequence doesn't get explored on forever after the
+    point has already been made.
+    """
+    board = chess.Board(fen)
+    fens = [board.fen()]
+    moves_san: list[str] = []
+    evals: list[int] = []
+
+    move = board.parse_san(first_move)
+    board.push(move)
+    moves_san.append(first_move)
+    fens.append(board.fen())
+
+    info = engine.analyse(board, chess.engine.Limit(depth=15))
+    evals.append(info["score"].pov(chess.WHITE).score(mate_score=10000))
+
+    recent_changes: list[int] = []
+    while len(moves_san) < max_plies:
+        pv = info.get("pv", [])
+        if not pv:
+            break
+        try:
+            next_move = pv[0]
+            san = board.san(next_move)
+        except Exception:
+            break
+        board.push(next_move)
+        moves_san.append(san)
+        fens.append(board.fen())
+
+        info = engine.analyse(board, chess.engine.Limit(depth=15))
+        new_eval = info["score"].pov(chess.WHITE).score(mate_score=10000)
+        recent_changes.append(abs(new_eval - evals[-1]))
+        evals.append(new_eval)
+
+        if (len(recent_changes) >= stabilize_window
+                and all(c <= stabilize_threshold for c in recent_changes[-stabilize_window:])):
+            break
+
+    return {"fens": fens, "moves": moves_san, "evals": evals}
 
 
 def _quality(eval_change: int) -> str:
@@ -253,32 +338,35 @@ def analyze_game(pgn_text, color):
     worst_moves = [m for m in moves_data if m["quality"] in ("blunder", "mistake")]
     worst_moves.sort(key=lambda x: x["move_index"])
 
-    # Enrich each critical mistake with Stockfish PV lines and python-chess facts
-    # (sequential — engine is not thread-safe)
+    # Enrich each critical mistake with a short Stockfish PV (for the
+    # move_caption "gets recaptured" check) and python-chess facts.
+    # (sequential — engine is not thread-safe). The full continuation for
+    # on-board exploration is computed separately, on demand, by explore_line —
+    # not here, since that needs an eval at every ply and would be too slow to
+    # do for every flagged mistake up front.
     for m in worst_moves:
-        m["played_continuation"] = _get_pv_san(m["fen_before"], m["move"])
         if m["best_move"]:
             m["best_continuation"] = _get_pv_san(m["fen_before"], m["best_move"])
         else:
             m["best_continuation"] = []
 
-        m["move_facts"] = _compute_move_facts(m["fen_before"], m["move"], m["best_move"])
+        best_reply = m["best_continuation"][0] if m["best_continuation"] else None
+        m["move_facts"] = _compute_move_facts(m["fen_before"], m["move"], m["best_move"], best_reply)
 
         print("--- CRITICAL MISTAKE DEBUG ---")
         print(f"  Move played      : {m['move']}")
         print(f"  FEN before       : {m['fen_before']}")
-        print(f"  Played PV        : {m['played_continuation']}")
         print(f"  Best move        : {m['best_move']}")
         print(f"  Best PV          : {m['best_continuation']}")
         print(f"  Centipawn loss   : {m['eval_change']}")
         print(f"  Computed facts   : {m['move_facts']}")
         print("------------------------------")
 
-    with ThreadPoolExecutor() as executor:
-        explanations = list(executor.map(explain_move, worst_moves))
-
-    for move_data, explanation in zip(worst_moves, explanations):
-        move_data["explanation"] = explanation
+    # Per-move captions are fully deterministic (no LLM call) — built straight
+    # from the verified facts above, so they can't be wrong the way a
+    # generated explanation could.
+    for move_data in worst_moves:
+        move_data["explanation"] = move_caption(move_data)
 
     if worst_moves:
         summary_result = summarize_game(worst_moves)

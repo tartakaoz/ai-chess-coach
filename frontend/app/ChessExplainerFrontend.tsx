@@ -71,6 +71,20 @@ export default function ChessExplainerFrontend() {
   const cardRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const [modal, setModal] = useState<"summary" | "lessons" | null>(null);
 
+  // "Explore best line" — plays out the engine's recommended continuation for
+  // a flagged mistake on the actual board, computed on demand (not during the
+  // main analysis) since evaluating every ply of a hypothetical line needs a
+  // fresh engine search per ply.
+  const [exploring, setExploring] = useState<{
+    moveIndex: number;
+    fens: string[];
+    moves: string[];
+    evals: number[];
+    step: number;
+  } | null>(null);
+  const [exploreLoadingFor, setExploreLoadingFor] = useState<number | null>(null);
+  const preExploreRef = useRef<{ boardIndex: number; selectedMove: any } | null>(null);
+
 
   const analyzeGame = useCallback(async () => {
     setLoading(true);
@@ -98,6 +112,42 @@ export default function ChessExplainerFrontend() {
     mainRef.current?.focus();
   }, [pgn, color]);
 
+  const startExplore = useCallback(async (move: any) => {
+    setExploreLoadingFor(move.move_index);
+    try {
+      const response = await fetch("http://127.0.0.1:8000/explore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fen: move.fen_before, first_move: move.best_move }),
+      });
+      if (!response.ok) {
+        console.error("Explore failed: HTTP", response.status, await response.text());
+        setExploreLoadingFor(null);
+        return;
+      }
+      const data = await response.json();
+      preExploreRef.current = { boardIndex, selectedMove };
+      setExploring({
+        moveIndex: move.move_index,
+        fens: data.fens,
+        moves: data.moves,
+        evals: data.evals,
+        step: 0,
+      });
+    } catch (error) {
+      console.error("Explore failed:", error instanceof Error ? error.message : error, error);
+    }
+    setExploreLoadingFor(null);
+  }, [boardIndex, selectedMove]);
+
+  const exitExplore = useCallback(() => {
+    setExploring(null);
+    if (preExploreRef.current) {
+      setBoardIndex(preExploreRef.current.boardIndex);
+      setSelectedMove(preExploreRef.current.selectedMove);
+    }
+  }, []);
+
   const positions = useMemo(() => buildPositionsFromPgn(pgn), [pgn]);
 
   // Per-index from/to squares + move flags for sound detection
@@ -106,7 +156,7 @@ export default function ChessExplainerFrontend() {
     try { source = new Chess(); source.loadPgn(pgn); } catch { return [null]; }
     const sans = source.history();           // plain SAN strings from the loaded game
     const viewer = new Chess();              // fresh board replayed move by move
-    const history: ({ from: string; to: string; flags: string; san: string; isCheck: boolean; isCheckmate: boolean } | null)[] = [null];
+    const history: ({ from: string; to: string; flags: string; san: string; isCheck: boolean; isCheckmate: boolean; captured?: string; color: string } | null)[] = [null];
     for (const san of sans) {
       const result = viewer.move(san);       // move returns the Move object computed from live state
       if (!result) break;                    // stop if chess.js rejects a move
@@ -117,6 +167,8 @@ export default function ChessExplainerFrontend() {
         san: result.san,                     // san from live viewer (always O-O, never 0-0)
         isCheck: viewer.isCheck(),           // board state immediately after move
         isCheckmate: viewer.isCheckmate(),   // board state immediately after move
+        captured: result.captured,           // piece type captured this move, if any ('p','n','b','r','q')
+        color: result.color,                 // 'w' or 'b' — who made this move
       });
     }
     return history;
@@ -143,77 +195,94 @@ export default function ChessExplainerFrontend() {
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const buffersRef = useRef<Record<string, AudioBuffer>>({});
+  const buffersLoadingRef = useRef(false);
 
-  useEffect(() => {
-    const soundFiles: Record<string, string> = {
-      move:      "/sounds/Move.mp3",
-      capture:   "/sounds/Capture.mp3",
-      castle:    "/sounds/Move.mp3",
-      promote:   "/sounds/Promote.mp3",
-      check:     "/sounds/GenericNotify.mp3",
-      checkmate: "/sounds/Victory.mp3",
-    };
+  const SOUND_FILES: Record<string, string> = {
+    move:      "/sounds/Move.mp3",
+    capture:   "/sounds/Capture.mp3",
+    castle:    "/sounds/Move.mp3",
+    promote:   "/sounds/Promote.mp3",
+    check:     "/sounds/GenericNotify.mp3",
+    checkmate: "/sounds/Victory.mp3",
+  };
 
-    const loadBuffers = (ctx: AudioContext) => {
-      Object.entries(soundFiles).forEach(([key, path]) => {
+  // Creates (or recreates, or resumes) the AudioContext on demand, right at
+  // the moment a sound needs to play — rather than relying on a separate
+  // "warm it up on the first click anywhere" listener set up ahead of time.
+  // That split design was fragile: if that context ever got torn down (a dev
+  // hot-reload, or Safari closing it when the tab was backgrounded) and the
+  // user's next action was directly clicking Next/Previous rather than some
+  // unrelated click first, sound would silently stay dead. Calling this
+  // directly inside a click/keydown handler is itself a valid user gesture,
+  // so it's safe to create/resume the context right here every time.
+  const ensureAudio = useCallback((): AudioContext | null => {
+    let ctx = audioCtxRef.current;
+    if (!ctx || ctx.state === "closed") {
+      try {
+        ctx = new AudioContext();
+      } catch (err) {
+        console.error('[Sound] Failed to create AudioContext:', err);
+        return null;
+      }
+      audioCtxRef.current = ctx;
+      buffersRef.current = {};
+      buffersLoadingRef.current = false;
+      console.log('[Sound] AudioContext created, state:', ctx.state);
+    }
+    if (ctx.state === "suspended") {
+      ctx.resume().catch(err => console.error('[Sound] resume failed:', err));
+    }
+    if (!buffersLoadingRef.current) {
+      buffersLoadingRef.current = true;
+      const activeCtx = ctx;
+      Object.entries(SOUND_FILES).forEach(([key, path]) => {
         fetch(path)
           .then(r => r.arrayBuffer())
-          .then(ab => ctx.decodeAudioData(ab))
+          .then(ab => activeCtx.decodeAudioData(ab))
           .then(buf => {
             buffersRef.current[key] = buf;
             console.log('[Sound] Buffer loaded:', key);
           })
           .catch(err => console.error('[Sound] Buffer load failed:', key, err));
       });
-    };
+    }
+    return ctx;
+  }, []);
 
-    const initAudio = () => {
-      if (audioCtxRef.current) return;
-      const ctx = new AudioContext();
-      audioCtxRef.current = ctx;
-      console.log('[Sound] AudioContext created, state:', ctx.state);
-      loadBuffers(ctx);
-    };
-
-    // Safari (and some other browsers) suspend, or sometimes fully close, the
-    // AudioContext when the tab is backgrounded to save power. Without this,
-    // switching away and back leaves sound permanently dead until a hard reload.
-    // When the tab becomes visible/focused again: resume a merely-suspended
-    // context, or recreate it (and re-decode all buffers) if it was closed outright.
-    const handleVisibility = () => {
-      if (document.visibilityState !== "visible") return;
-      const ctx = audioCtxRef.current;
-      if (!ctx) return;
-      if (ctx.state === "closed") {
-        console.warn('[Sound] AudioContext was closed while tab was backgrounded — recreating.');
-        const fresh = new AudioContext();
-        audioCtxRef.current = fresh;
-        buffersRef.current = {};
-        loadBuffers(fresh);
-      } else if (ctx.state === "suspended") {
-        ctx.resume()
-          .then(() => console.log('[Sound] AudioContext resumed after tab became visible.'))
-          .catch(err => console.error('[Sound] Failed to resume AudioContext on visibility change:', err));
-      }
-    };
-
-    window.addEventListener("pointerdown", initAudio, { once: true });
-    window.addEventListener("keydown", initAudio, { once: true });
-    document.addEventListener("visibilitychange", handleVisibility);
-    window.addEventListener("focus", handleVisibility);
+  // Dispose the context on unmount so a dev hot-reload doesn't orphan it —
+  // harmless either way now, since ensureAudio() recreates on next use.
+  useEffect(() => {
     return () => {
-      window.removeEventListener("pointerdown", initAudio);
-      window.removeEventListener("keydown", initAudio);
-      document.removeEventListener("visibilitychange", handleVisibility);
-      window.removeEventListener("focus", handleVisibility);
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        audioCtxRef.current.close().catch(() => {});
+      }
+      audioCtxRef.current = null;
+      buffersRef.current = {};
+      buffersLoadingRef.current = false;
     };
   }, []);
+
+  const playSound = useCallback((key: string, gainValue: number) => {
+    const ctx = ensureAudio();
+    const buf = buffersRef.current[key];
+    console.log('[Sound] play —', key, '| ctx:', ctx?.state ?? 'null', '| buf:', buf ? 'loaded' : 'missing');
+    if (ctx && buf) {
+      ctx.resume().then(() => {
+        const gain = ctx.createGain();
+        gain.gain.value = gainValue;
+        gain.connect(ctx.destination);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(gain);
+        src.start();
+      }).catch(err => console.error('[Sound] play failed:', err));
+    }
+  }, [ensureAudio]);
 
   const playMoveSound = useCallback((index: number) => {
     if (index === 0) return;
     const move = moveHistory[index];
     if (!move) return;
-    console.log('SAN:', JSON.stringify(move.san), '| flags:', move.flags, '| isCheck:', move.isCheck, '| isCheckmate:', move.isCheckmate);
     const isCastle = move.san === "O-O-O" || move.san === "O-O";
     const isPromotion = move.flags.includes("p");
     const isCapture = move.flags.includes("c") || move.flags.includes("e");
@@ -223,38 +292,12 @@ export default function ChessExplainerFrontend() {
     else if (isCastle)     key = "castle";
     else if (isPromotion)  key = "promote";
     else if (isCapture)    key = "capture";
-    const ctx = audioCtxRef.current;
-    const buf = buffersRef.current[key];
-    console.log('[Sound] playMoveSound — key:', key, '| ctx:', ctx?.state ?? 'null', '| buf:', buf ? 'loaded' : 'missing');
-    if (ctx && buf) {
-      ctx.resume().then(() => {
-        const gain = ctx.createGain();
-        gain.gain.value = 0.4;
-        gain.connect(ctx.destination);
-        const src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(gain);
-        src.start();
-      }).catch(err => console.error('[Sound] playMoveSound resume/play failed:', err));
-    }
-  }, [moveHistory]);
+    playSound(key, 0.4);
+  }, [moveHistory, playSound]);
 
   const playBackSound = useCallback(() => {
-    const ctx = audioCtxRef.current;
-    const buf = buffersRef.current["move"];
-    console.log('[Sound] playBackSound — ctx:', ctx?.state ?? 'null', '| buf:', buf ? 'loaded' : 'missing');
-    if (ctx && buf) {
-      ctx.resume().then(() => {
-        const gain = ctx.createGain();
-        gain.gain.value = 0.2;
-        gain.connect(ctx.destination);
-        const src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(gain);
-        src.start();
-      }).catch(err => console.error('[Sound] playBackSound resume/play failed:', err));
-    }
-  }, []);
+    playSound("move", 0.2);
+  }, [playSound]);
 
   const goNext = useCallback(async () => {
     if (result === null && !loading) {
@@ -297,26 +340,41 @@ export default function ChessExplainerFrontend() {
       if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
       if (e.key === "ArrowLeft") {
         e.preventDefault();
+        if (exploring) {
+          setExploring((prev) => prev && ({ ...prev, step: Math.max(0, prev.step - 1) }));
+          return;
+        }
         const prev = Math.max(boardIndexRef.current - 1, 0);
         setBoardIndex(prev);
         setSelectedMove(null);
         if (prev > 0) { playBackSound(); }
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
+        if (exploring) {
+          setExploring((prev) => prev && ({ ...prev, step: Math.min(prev.fens.length - 1, prev.step + 1) }));
+          return;
+        }
         goNext();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [goNext]);
+  }, [goNext, exploring]);
 
-const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex];
+const displayFen = exploring
+  ? exploring.fens[exploring.step]
+  : selectedMove ? selectedMove.fen_after : positions[boardIndex];
   // Eval bar: cap at ±1000 centipawns (±10 pawns)
-  const evalCp = selectedMove
-  ? selectedMove.eval_after
-: result?.position_evals?.find((p: any) => p.move_index === boardIndex)?.eval ?? 0;
+  const evalCp = exploring
+    ? exploring.evals[exploring.step]
+    : selectedMove
+    ? selectedMove.eval_after
+    : result?.position_evals?.find((p: any) => p.move_index === boardIndex)?.eval ?? 0;
 
-      const perspectiveEval = color === "black" ? -evalCp : evalCp;
+      // The /explore endpoint already returns evals from White's POV; the
+      // main analysis stores evals from the analyzed player's POV instead,
+      // so only that path needs the color-based flip.
+      const perspectiveEval = exploring ? evalCp : (color === "black" ? -evalCp : evalCp);
       const clampedEval = Math.max(-1000, Math.min(1000, perspectiveEval));
       const whitePct = ((clampedEval + 1000) / 2000) * 100;
       const blackPct = 100 - whitePct;
@@ -347,8 +405,11 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
   // Quality-based color for both players; neutral gray before analysis is loaded
   const moveQualityColor = MOVE_QUALITY_COLORS[currentMoveQuality?.quality ?? ""] ?? NEUTRAL_HIGHLIGHT;
 
+  // While exploring a hypothetical line, suppress the real game's move-quality
+  // highlights and best-move arrow — they don't apply to positions that never
+  // actually occurred, and would be confusing overlaid on an explore line.
   const squareColorMap: Record<string, string> = {};
-  if (lastMove) {
+  if (lastMove && !exploring) {
     squareColorMap[lastMove.from] = moveQualityColor;
     squareColorMap[lastMove.to] = moveQualityColor;
   }
@@ -367,6 +428,7 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
     posEval.best_move.slice(0, 2) === playedMove.from &&
     posEval.best_move.slice(2, 4) === playedMove.to;
   const showArrow =
+    !exploring &&
     boardIndex > 0 &&
     posEval?.best_move &&
     !bestMatchesPlayed &&
@@ -374,6 +436,72 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
   const arrows: { startSquare: string; endSquare: string; color: string }[] = showArrow
     ? [{ startSquare: posEval.best_move.slice(0, 2), endSquare: posEval.best_move.slice(2, 4), color: arrowColor }]
     : [];
+
+  // Captured-material trays: walk every move up to the current board index and
+  // bucket captures by who made them. "capturedByWhite" holds pieces White has
+  // taken from Black (originally black pieces), and vice versa.
+  const PIECE_GLYPH: Record<string, { white: string; black: string }> = {
+    p: { white: "♙", black: "♟" },
+    n: { white: "♘", black: "♞" },
+    b: { white: "♗", black: "♝" },
+    r: { white: "♖", black: "♜" },
+    q: { white: "♕", black: "♛" },
+  };
+  const PIECE_ORDER: Record<string, number> = { p: 0, n: 1, b: 2, r: 3, q: 4 };
+  const capturedByWhite: string[] = [];
+  const capturedByBlack: string[] = [];
+  for (let i = 1; i <= boardIndex; i++) {
+    const m = moveHistory[i];
+    if (m && m.captured) {
+      if (m.color === "w") capturedByWhite.push(m.captured);
+      else capturedByBlack.push(m.captured);
+    }
+  }
+  const byValue = (a: string, b: string) => (PIECE_ORDER[a] ?? 9) - (PIECE_ORDER[b] ?? 9);
+  capturedByWhite.sort(byValue);
+  capturedByBlack.sort(byValue);
+
+  // While exploring a hypothetical line, the trays should show captures from
+  // the real game up to the point of divergence (before the missed move)
+  // plus whatever the explored line itself has captured so far — not the
+  // real game's captures at the frozen boardIndex, which has nothing to do
+  // with the position currently on screen.
+  let displayCapturedByWhite = capturedByWhite;
+  let displayCapturedByBlack = capturedByBlack;
+  if (exploring) {
+    const baseWhite: string[] = [];
+    const baseBlack: string[] = [];
+    for (let i = 1; i < exploring.moveIndex; i++) {
+      const m = moveHistory[i];
+      if (m && m.captured) {
+        if (m.color === "w") baseWhite.push(m.captured);
+        else baseBlack.push(m.captured);
+      }
+    }
+    const lineWhite: string[] = [];
+    const lineBlack: string[] = [];
+    try {
+      const replay = new Chess(exploring.fens[0]);
+      for (let i = 0; i < exploring.step; i++) {
+        const res = replay.move(exploring.moves[i]);
+        if (res && res.captured) {
+          if (res.color === "w") lineWhite.push(res.captured);
+          else lineBlack.push(res.captured);
+        }
+      }
+    } catch { /* malformed line — leave whatever was captured before the failure */ }
+    displayCapturedByWhite = [...baseWhite, ...lineWhite].sort(byValue);
+    displayCapturedByBlack = [...baseBlack, ...lineBlack].sort(byValue);
+  }
+
+  // "Guest" is always the side you're analyzing (whichever color you picked),
+  // "Random Noob" is always the opponent — so the labels follow the color
+  // selector rather than being pinned to White/Black. The board orientation
+  // logic above already puts your selected color at the bottom, so this also
+  // determines which literal color (white/black) sits at the top vs. bottom.
+  const whiteName = color === "white" ? "Guest" : "Random Noob";
+  const blackName = color === "black" ? "Guest" : "Random Noob";
+  const topIsWhite = color === "black";
 
   const btnStyle: React.CSSProperties = {
     background: "rgba(255,255,255,0.08)",
@@ -410,8 +538,27 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
       {/* Two-column layout: left = board area, right = analysis panel */}
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "row", gap: "24px", overflow: "hidden" }}>
 
-        {/* Left column: fixed width, board flush to left edge */}
-        <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", gap: "12px" }}>
+        {/* Left column: fixed width, board flush to left edge. Explicit width so
+            long content (like the explore-line move list) wraps instead of
+            stretching this column — and pushing the right column with it. */}
+        <div style={{ width: `${boardSize + 30}px`, flexShrink: 0, display: "flex", flexDirection: "column", gap: "12px" }}>
+
+          {/* Top profile bar — whichever color sits at the top of the board given orientation */}
+          <div style={{ marginLeft: "30px", display: "flex", alignItems: "center", gap: "8px", height: "48px" }}>
+            <span style={{ fontSize: "13px", fontWeight: 600, color: "#e8e0d0" }}>
+              {topIsWhite ? whiteName : blackName}
+            </span>
+            <span style={{ fontSize: "45px", lineHeight: 1, letterSpacing: "-3px" }}>
+              {(topIsWhite ? displayCapturedByWhite : displayCapturedByBlack).map((p, i) => {
+                const side = topIsWhite ? "black" : "white";
+                return (
+                  <span key={i} style={{ color: side === "white" ? "#f0d9b5" : "#4a7c6f" }}>
+                    {PIECE_GLYPH[p]?.[side]}
+                  </span>
+                );
+              })}
+            </span>
+          </div>
 
           {/* Eval bar + Board side by side */}
           <div style={{ display: "flex", gap: "10px", alignItems: "flex-start" }}>
@@ -475,27 +622,82 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
             </div>
           </div>
 
-          {/* Navigator */}
-          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-            <button style={btnStyle} onClick={() => { setBoardIndex(0); setSelectedMove(null); }}>⏮</button>
-            <button style={btnStyle} onClick={() => {
-              const prev = Math.max(boardIndex - 1, 0);
-              setBoardIndex(prev);
-              setSelectedMove(null);
-              if (prev > 0) { playBackSound(); }
-            }}>
-              Previous
-            </button>
-            <button style={btnStyle} onClick={goNext}>
-              Next
-            </button>
-            <span style={{ fontSize: "12px", color: "rgba(232,224,208,0.55)", marginLeft: "4px" }}>
-              {boardIndex === 0
-                ? `Start`
-                : `${formatMoveLabel(boardIndex)} ${sanMoves[boardIndex - 1] ?? ""}`}
-              {" "}({boardIndex}/{positions.length - 1})
+          {/* Bottom profile bar — whichever color sits at the bottom of the board given orientation */}
+          <div style={{ marginLeft: "30px", display: "flex", alignItems: "center", gap: "8px", height: "48px" }}>
+            <span style={{ fontSize: "13px", fontWeight: 600, color: "#e8e0d0" }}>
+              {topIsWhite ? blackName : whiteName}
+            </span>
+            <span style={{ fontSize: "45px", lineHeight: 1, letterSpacing: "-3px" }}>
+              {(topIsWhite ? displayCapturedByBlack : displayCapturedByWhite).map((p, i) => {
+                const side = topIsWhite ? "white" : "black";
+                return (
+                  <span key={i} style={{ color: side === "white" ? "#f0d9b5" : "#4a7c6f" }}>
+                    {PIECE_GLYPH[p]?.[side]}
+                  </span>
+                );
+              })}
             </span>
           </div>
+
+          {/* Navigator — swapped out entirely while exploring a hypothetical line.
+              Fixed width (matches the left column) + wrapping text, so a long
+              move list wraps onto more lines instead of stretching the column
+              wider and pushing the right-hand panel out of place. */}
+          {exploring ? (
+            <div style={{ width: `${boardSize + 30}px`, display: "flex", flexDirection: "column", gap: "6px" }}>
+              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                <button
+                  style={btnStyle}
+                  disabled={exploring.step === 0}
+                  onClick={() => setExploring((prev) => prev && ({ ...prev, step: Math.max(0, prev.step - 1) }))}
+                >
+                  Previous
+                </button>
+                <button
+                  style={btnStyle}
+                  disabled={exploring.step >= exploring.fens.length - 1}
+                  onClick={() => setExploring((prev) => prev && ({ ...prev, step: Math.min(prev.fens.length - 1, prev.step + 1) }))}
+                >
+                  Next
+                </button>
+                <button
+                  style={{ ...btnStyle, marginLeft: "auto", border: "1px solid #d4af37", color: "#d4af37" }}
+                  onClick={exitExplore}
+                >
+                  ↩ Return to game
+                </button>
+              </div>
+              <span style={{
+                fontSize: "12px",
+                color: "rgba(232,224,208,0.55)",
+                whiteSpace: "normal",
+                wordBreak: "break-word",
+              }}>
+                Exploring ({exploring.step}/{exploring.fens.length - 1}): {exploring.moves.slice(0, exploring.step).join(" ") || "start"}
+              </span>
+            </div>
+          ) : (
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <button style={btnStyle} onClick={() => { setBoardIndex(0); setSelectedMove(null); }}>⏮</button>
+              <button style={btnStyle} onClick={() => {
+                const prev = Math.max(boardIndex - 1, 0);
+                setBoardIndex(prev);
+                setSelectedMove(null);
+                if (prev > 0) { playBackSound(); }
+              }}>
+                Previous
+              </button>
+              <button style={btnStyle} onClick={goNext}>
+                Next
+              </button>
+              <span style={{ fontSize: "12px", color: "rgba(232,224,208,0.55)", marginLeft: "4px" }}>
+                {boardIndex === 0
+                  ? `Start`
+                  : `${formatMoveLabel(boardIndex)} ${sanMoves[boardIndex - 1] ?? ""}`}
+                {" "}({boardIndex}/{positions.length - 1})
+              </span>
+            </div>
+          )}
 
         </div>
 
@@ -553,6 +755,7 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
                     key={index}
                     ref={(el) => { cardRefs.current[move.move_index] = el; }}
                     onClick={() => {
+                      if (exploring) setExploring(null);
                       setSelectedMove(move);
                       setBoardIndex(move.move_index);
                       playMoveSound(move.move_index);
@@ -592,7 +795,37 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
                         <div style={{ position: "relative", background: "rgba(240,236,220,0.95)", color: "#1a1a2e", borderRadius: "10px", padding: "10px 13px", fontSize: "14px", lineHeight: "1.65", flex: 1, border: "1px solid rgba(212,175,55,0.5)" }}>
                           {/* Left-pointing triangle */}
                           <div style={{ position: "absolute", left: "-8px", top: "14px", width: 0, height: 0, borderTop: "7px solid transparent", borderBottom: "7px solid transparent", borderRight: "8px solid rgba(240,236,220,0.95)" }} />
-                          {move.explanation}
+                          {/* Short deterministic caption */}
+                          <div style={{ fontWeight: 600, marginBottom: "8px" }}>{move.explanation}</div>
+                          <div style={{ fontSize: "12.5px", opacity: 0.85 }}>
+                            Best move: <strong>{move.best_move}</strong>
+                          </div>
+                          {/* Plays the engine's actual recommended continuation out on the
+                              board, evaluated move by move, until the position settles down. */}
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              startExplore(move);
+                            }}
+                            disabled={exploreLoadingFor === move.move_index}
+                            style={{
+                              marginTop: "8px",
+                              fontSize: "12.5px",
+                              fontWeight: 600,
+                              padding: "5px 10px",
+                              borderRadius: "6px",
+                              border: "1px solid rgba(26,26,46,0.3)",
+                              background: exploring?.moveIndex === move.move_index ? "rgba(212,175,55,0.35)" : "rgba(26,26,46,0.08)",
+                              color: "#1a1a2e",
+                              cursor: exploreLoadingFor === move.move_index ? "default" : "pointer",
+                            }}
+                          >
+                            {exploreLoadingFor === move.move_index
+                              ? "Loading…"
+                              : exploring?.moveIndex === move.move_index
+                              ? "▶ Exploring this line"
+                              : "▶ Explore best line on board"}
+                          </button>
                         </div>
                       </div>
                     )}
@@ -641,7 +874,7 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
                       <span
                         ref={whiteActive ? activeItemRef : null}
                         style={whiteActive ? activeStyle : inactiveStyle}
-                        onClick={() => { setBoardIndex(whiteIdx); setSelectedMove(null); playMoveSound(whiteIdx); }}
+                        onClick={() => { if (exploring) setExploring(null); setBoardIndex(whiteIdx); setSelectedMove(null); playMoveSound(whiteIdx); }}
                       >
                         {sanMoves[i * 2]}
                       </span>
@@ -651,7 +884,7 @@ const displayFen = selectedMove ? selectedMove.fen_after : positions[boardIndex]
                           <span
                             ref={blackActive ? activeItemRef : null}
                             style={blackActive ? activeStyle : inactiveStyle}
-                            onClick={() => { setBoardIndex(blackIdx); setSelectedMove(null); playMoveSound(blackIdx); }}
+                            onClick={() => { if (exploring) setExploring(null); setBoardIndex(blackIdx); setSelectedMove(null); playMoveSound(blackIdx); }}
                           >
                             {sanMoves[i * 2 + 1]}
                           </span>
